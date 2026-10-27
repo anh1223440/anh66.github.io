@@ -26,8 +26,9 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
 const FACE_SERVICE_URL = process.env.FACE_SERVICE_URL || "http://localhost:8000";
 const MEMORIES_FOLDER_NAME = process.env.MEMORIES_FOLDER_NAME || "anh cacke";
-const MEMORIES_FOLDER_ID = process.env.MEMORIES_FOLDER_ID || ""; // Biến mới cho phép chủ động chọn thư mục
+const MEMORIES_FOLDER_ID = process.env.MEMORIES_FOLDER_ID || "";
 
+// Chỉ dùng các account này để Upload và làm các việc khác
 const DRIVE_ACCOUNTS = [
   { folderId: process.env.DRIVE_FOLDER_ID_1 || "", refreshToken: process.env.DRIVE_REFRESH_TOKEN_1 || "" },
   { folderId: process.env.DRIVE_FOLDER_ID_2 || "", refreshToken: process.env.DRIVE_REFRESH_TOKEN_2 || "" },
@@ -99,38 +100,23 @@ function getDriveClient(refreshToken: string) {
   return google.drive({ version: "v3", auth });
 }
 
-// CẬP NHẬT: Hàm lấy thư mục ưu tiên ID có sẵn, nếu không có mới tìm/tạo
 async function getOrCreateMemoriesFolder(drive: any, parentFolderId: string): Promise<string> {
-  // 1. Nếu đã cấu hình ID trong .env, dùng luôn ID đó
-  if (MEMORIES_FOLDER_ID) {
-    return MEMORIES_FOLDER_ID;
-  }
-
-  // 2. Nếu không có ID, tự động tìm hoặc tạo thư mục theo tên
+  if (MEMORIES_FOLDER_ID) return MEMORIES_FOLDER_ID;
   try {
     const res = await drive.files.list({
       q: `name='${MEMORIES_FOLDER_NAME}' and '${parentFolderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-      fields: 'files(id)',
-      spaces: 'drive',
+      fields: 'files(id)', spaces: 'drive',
     });
+    if (res.data.files && res.data.files.length > 0) return res.data.files[0].id;
 
-    if (res.data.files && res.data.files.length > 0) {
-      return res.data.files[0].id;
-    }
-
-    const folderMetadata = {
-      name: MEMORIES_FOLDER_NAME,
-      mimeType: 'application/vnd.google-apps.folder',
-      parents: [parentFolderId],
-    };
     const folder = await drive.files.create({
-      requestBody: folderMetadata,
+      requestBody: { name: MEMORIES_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder', parents: [parentFolderId] },
       fields: 'id',
     });
     return folder.data.id;
   } catch (error) {
     console.error("Lỗi khi tạo thư mục Memories:", error);
-    return parentFolderId; // Fallback: lưu vào thư mục gốc
+    return parentFolderId;
   }
 }
 
@@ -336,8 +322,6 @@ async function renderMemoryVideo(memoryId: number) {
     for (const account of DRIVE_ACCOUNTS) {
       try {
         const drive = getDriveClient(account.refreshToken);
-        
-        // Lấy thư mục (ưu tiên ID có sẵn, nếu không thì tìm/tạo theo tên)
         const memoriesFolderId = await getOrCreateMemoriesFolder(drive, account.folderId);
 
         const driveRes = await drive.files.create({
@@ -365,7 +349,11 @@ async function renderMemoryVideo(memoryId: number) {
   }
 }
 
-// Routes
+
+// ==========================================
+// ROUTES API
+// ==========================================
+
 app.get("/api/albums", async (req, res) => { try { res.json(await dbQuery("SELECT * FROM albums ORDER BY name ASC", "")); } catch { res.status(500).json({ error: "Err" }); } });
 app.post("/api/albums", async (req, res) => { const { name } = req.body; if (!name) return res.status(400).json({ error: "Name required" }); try { const id = await dbInsertReturningId("INSERT INTO albums (name) VALUES ($1) RETURNING id", "", [name]); res.json({ id, name }); } catch { res.status(400).json({ error: "Exists" }); } });
 app.delete("/api/albums/:id", async (req, res) => { try { await dbRun("DELETE FROM albums WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
@@ -453,70 +441,115 @@ app.delete("/api/media/:id", async (req, res) => {
 
 app.put("/api/media/:id/album", async (req, res) => { try { await dbRun("UPDATE media SET album_id = $1 WHERE id = $2", "", [req.body.album_id || null, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
 
-app.get("/api/faces/scan/status", (req, res) => res.json(scanState));
-app.post("/api/faces/scan", (req, res) => { if (scanState.running) return res.json({ success: false }); scanAllFaces().catch(console.error); res.json({ success: true }); });
 
-app.get("/api/faces/people", async (req, res) => {
+// ==========================================
+// API DRIVE (Dành riêng cho tab Folder)
+// ==========================================
+app.get("/api/drive/files", async (req, res) => {
   try {
-    res.json(await dbQuery(`SELECT c.*, f.thumbnail_base64 as cover_thumb FROM face_clusters c LEFT JOIN face_embeddings f ON c.cover_face_id = f.id WHERE c.face_count >= 2 ORDER BY c.face_count DESC`, ""));
-  } catch { res.status(500).json({ error: "Err" }); }
+    const { folderId } = req.query;
+    if (!folderId) return res.status(400).json({ error: "folderId is required" });
+
+    // Vì folder ID được truyền trực tiếp, ta thử tìm trên tất cả các account
+    let filesData: any[] = [];
+    let success = false;
+
+    for (const account of DRIVE_ACCOUNTS) {
+      try {
+        const drive = getDriveClient(account.refreshToken);
+        const response = await drive.files.list({
+          q: `'${folderId}' in parents and trashed=false and (mimeType contains 'image/' or mimeType contains 'video/')`,
+          fields: 'files(id, name, mimeType, size)',
+          pageSize: 1000,
+          orderBy: 'name_natural'
+        });
+        filesData = response.data.files || [];
+        success = true;
+        break; // Nếu thành công thì dừng
+      } catch (e: any) {
+        // 404 có thể do token này không có quyền, thử token khác
+        continue;
+      }
+    }
+
+    if (!success) {
+      return res.status(404).json({ error: "Không tìm thấy folder hoặc không có quyền truy cập." });
+    }
+
+    res.json(filesData);
+  } catch (error: any) {
+    console.error("Drive files error:", error);
+    res.status(500).json({ error: "Lỗi khi lấy danh sách file từ Drive." });
+  }
 });
 
-app.get("/api/faces/thumbnail/:faceId", async (req, res) => {
+app.get("/api/drive/stream/:id", async (req, res) => {
   try {
-    const face = await dbGet("SELECT thumbnail_base64 FROM face_embeddings WHERE id = $1", "", [req.params.faceId]);
-    if (!face || !face.thumbnail_base64) return res.status(404).end();
-    res.setHeader("Content-Type", "image/jpeg");
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    res.send(Buffer.from(face.thumbnail_base64, "base64"));
-  } catch { res.status(500).end(); }
-});
-
-app.get("/api/faces/people/:clusterId/media", async (req, res) => {
-  try {
-    res.json(await dbQuery(`SELECT m.*, fe.face_index FROM media m JOIN face_embeddings fe ON m.id = fe.media_id WHERE fe.cluster_id = $1 ORDER BY m.created_at DESC`, "", [req.params.clusterId]));
-  } catch { res.status(500).json({ error: "Err" }); }
-});
-
-app.get("/api/faces/no-people", async (req, res) => {
-  try {
-    res.json(await dbQuery(`SELECT * FROM media WHERE has_people = FALSE AND face_processed = TRUE ORDER BY created_at DESC`, ""));
-  } catch { res.status(500).json({ error: "Err" }); }
-});
-
-app.put("/api/faces/people/:id", async (req, res) => { try { await dbRun("UPDATE face_clusters SET name = $1, updated_at = NOW() WHERE id = $2", "", [req.body.name, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
-app.delete("/api/faces/people/:id", async (req, res) => { try { await dbRun("UPDATE face_embeddings SET cluster_id = NULL WHERE cluster_id = $1", "", [req.params.id]); await dbRun("DELETE FROM face_clusters WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
-
-app.get("/api/memories", async (req, res) => { try { res.json(await dbQuery(`SELECT m.id, m.title, m.type, m.cluster_id, m.media_ids, m.cover_media_id, m.status, m.created_at, c.name as cluster_name FROM memories m LEFT JOIN face_clusters c ON m.cluster_id = c.id ORDER BY m.created_at DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.post("/api/memories/create", async (req, res) => { try { const id = await dbInsertReturningId(`INSERT INTO memories (title, type, cluster_id, status) VALUES ($1, 'person', $2, 'pending') RETURNING id`, "", [req.body.title || "Memories", req.body.clusterId]); res.json({ memoryId: id }); renderMemoryVideo(id).catch(console.error); } catch { res.status(500).json({ error: "Err" }); } });
-
-app.get("/api/memories/:id/video", async (req, res) => {
-  try {
-    const mem = await dbGet("SELECT video_base64 FROM memories WHERE id = $1", "", [req.params.id]);
-    if (!mem || !mem.video_base64) return res.status(404).json({ error: "Not ready" });
+    const { id } = req.params;
+    const isDownload = req.query.download === "true";
+    const isThumbnail = req.query.thumbnail === "true";
     
     let driveRes: any = null;
     for (const account of DRIVE_ACCOUNTS) {
       try {
         driveRes = await getDriveClient(account.refreshToken).files.get(
-          { fileId: mem.video_base64, alt: "media", acknowledgeAbuse: true },
+          { fileId: id, alt: "media", acknowledgeAbuse: true },
           { responseType: "stream" }
         );
         break;
       } catch (e: any) { if (e.code === 404) continue; }
     }
     
-    if (!driveRes) return res.status(404).json({ error: "Not found on Drive" });
+    if (!driveRes) return res.status(404).json({ error: "File not found on Drive" });
 
-    res.setHeader("Content-Type", "video/mp4");
+    if (isThumbnail) {
+      // Với thumbnail, ta không set Content-Type cố định vì Drive trả về đúng type
+      const meta = await driveRes.data;
+      res.setHeader("Content-Type", meta.headers?.["content-type"] || "image/jpeg");
+    } else {
+      res.setHeader("Content-Type", "application/octet-stream");
+    }
+    
+    if (isDownload) res.setHeader("Content-Disposition", `attachment`);
+    
     driveRes.data.pipe(res);
-  } catch { res.status(500).json({ error: "Err" }); }
+  } catch (error: any) {
+    res.status(500).json({ error: "Failed to stream file" });
+  }
 });
 
+// ==========================================
+// API KHÁC (Faces, Memories, ...)
+// ==========================================
+app.get("/api/faces/scan/status", (req, res) => res.json(scanState));
+app.post("/api/faces/scan", (req, res) => { if (scanState.running) return res.json({ success: false }); scanAllFaces().catch(console.error); res.json({ success: true }); });
+app.get("/api/faces/people", async (req, res) => { try { res.json(await dbQuery(`SELECT c.*, f.thumbnail_base64 as cover_thumb FROM face_clusters c LEFT JOIN face_embeddings f ON c.cover_face_id = f.id WHERE c.face_count >= 2 ORDER BY c.face_count DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
+app.get("/api/faces/thumbnail/:faceId", async (req, res) => { try { const face = await dbGet("SELECT thumbnail_base64 FROM face_embeddings WHERE id = $1", "", [req.params.faceId]); if (!face || !face.thumbnail_base64) return res.status(404).end(); res.setHeader("Content-Type", "image/jpeg"); res.setHeader("Cache-Control", "public, max-age=86400"); res.send(Buffer.from(face.thumbnail_base64, "base64")); } catch { res.status(500).end(); } });
+app.get("/api/faces/people/:clusterId/media", async (req, res) => { try { res.json(await dbQuery(`SELECT m.*, fe.face_index FROM media m JOIN face_embeddings fe ON m.id = fe.media_id WHERE fe.cluster_id = $1 ORDER BY m.created_at DESC`, "", [req.params.clusterId])); } catch { res.status(500).json({ error: "Err" }); } });
+app.get("/api/faces/no-people", async (req, res) => { try { res.json(await dbQuery(`SELECT * FROM media WHERE has_people = FALSE AND face_processed = TRUE ORDER BY created_at DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
+app.put("/api/faces/people/:id", async (req, res) => { try { await dbRun("UPDATE face_clusters SET name = $1, updated_at = NOW() WHERE id = $2", "", [req.body.name, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.delete("/api/faces/people/:id", async (req, res) => { try { await dbRun("UPDATE face_embeddings SET cluster_id = NULL WHERE cluster_id = $1", "", [req.params.id]); await dbRun("DELETE FROM face_clusters WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+
+app.get("/api/memories", async (req, res) => { try { res.json(await dbQuery(`SELECT m.id, m.title, m.type, m.cluster_id, m.media_ids, m.cover_media_id, m.status, m.created_at, c.name as cluster_name FROM memories m LEFT JOIN face_clusters c ON m.cluster_id = c.id ORDER BY m.created_at DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
+app.post("/api/memories/create", async (req, res) => { try { const id = await dbInsertReturningId(`INSERT INTO memories (title, type, cluster_id, status) VALUES ($1, 'person', $2, 'pending') RETURNING id`, "", [req.body.title || "Memories", req.body.clusterId]); res.json({ memoryId: id }); renderMemoryVideo(id).catch(console.error); } catch { res.status(500).json({ error: "Err" }); } });
+app.get("/api/memories/:id/video", async (req, res) => { try { const mem = await dbGet("SELECT video_base64 FROM memories WHERE id = $1", "", [req.params.id]); if (!mem || !mem.video_base64) return res.status(404).json({ error: "Not ready" }); let driveRes: any = null; for (const account of DRIVE_ACCOUNTS) { try { driveRes = await getDriveClient(account.refreshToken).files.get({ fileId: mem.video_base64, alt: "media", acknowledgeAbuse: true }, { responseType: "stream" }); break; } catch (e: any) { if (e.code === 404) continue; } } if (!driveRes) return res.status(404).json({ error: "Not found on Drive" }); res.setHeader("Content-Type", "video/mp4"); driveRes.data.pipe(res); } catch { res.status(500).json({ error: "Err" }); } });
 app.get("/api/memories/:id/cover", async (req, res) => { try { const mem = await dbGet("SELECT cover_media_id FROM memories WHERE id = $1", "", [req.params.id]); if (!mem?.cover_media_id) return res.status(404).end(); res.redirect(`/api/media/${mem.cover_media_id}/thumbnail?size=600`); } catch { res.status(404).end(); } });
 app.delete("/api/memories/:id", async (req, res) => { try { await dbRun("DELETE FROM memories WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
 
-// Start Server
+app.get("/api/notes", async (req, res) => { try { res.json(await dbQuery("SELECT * FROM notes ORDER BY created_at DESC", "")); } catch { res.status(500).json({ error: "Err" }); } });
+app.post("/api/notes", async (req, res) => { const { title, content, color } = req.body; try { const id = await dbInsertReturningId("INSERT INTO notes (title, content, color) VALUES ($1, $2, $3) RETURNING id", "", [title, content, color]); res.json({ id, title, content, color }); } catch { res.status(500).json({ error: "Err" }); } });
+app.put("/api/notes/:id", async (req, res) => { const { title, content, color } = req.body; try { await dbRun("UPDATE notes SET title=$1, content=$2, color=$3 WHERE id=$4", "", [title, content, color, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.delete("/api/notes/:id", async (req, res) => { try { await dbRun("DELETE FROM notes WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+
+app.get("/api/schedule", async (req, res) => { try { res.json(await dbQuery("SELECT * FROM schedule ORDER BY day_of_week, start_time", "")); } catch { res.status(500).json({ error: "Err" }); } });
+app.post("/api/schedule", async (req, res) => { const { subject, day_of_week, start_time, end_time, room } = req.body; try { const id = await dbInsertReturningId("INSERT INTO schedule (subject, day_of_week, start_time, end_time, room) VALUES ($1,$2,$3,$4,$5) RETURNING id", "", [subject, day_of_week, start_time, end_time, room]); res.json({ id, subject, day_of_week, start_time, end_time, room }); } catch { res.status(500).json({ error: "Err" }); } });
+app.put("/api/schedule/:id", async (req, res) => { const { subject, day_of_week, start_time, end_time, room } = req.body; try { await dbRun("UPDATE schedule SET subject=$1, day_of_week=$2, start_time=$3, end_time=$4, room=$5 WHERE id=$6", "", [subject, day_of_week, start_time, end_time, room, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.delete("/api/schedule/:id", async (req, res) => { try { await dbRun("DELETE FROM schedule WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+
+
+// ==========================================
+// CẤU HÌNH STATIC & KHỞI ĐỘNG SERVER
+// ==========================================
 async function startServer() {
   const cleanUp = () => {
     const dirs = ['face_cache', 'thumb_cache', 'memories', 'uploads'];
@@ -534,8 +567,16 @@ async function startServer() {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
+    // 1. Phục vụ file tĩnh
     app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
+    
+    // 2. Fallback SPA (Bỏ qua các route bắt đầu bằng /api)
+    app.get("*", (req, res) => {
+      if (req.path.startsWith("/api")) {
+        return res.status(404).json({ error: "API route not found" });
+      }
+      res.sendFile(path.join(__dirname, "dist", "index.html"));
+    });
   }
 
   const server = app.listen(Number(process.env.PORT || 3001), "0.0.0.0", () => {
