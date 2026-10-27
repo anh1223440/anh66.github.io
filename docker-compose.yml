@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: gallery-db
+    restart: always
+    environment:
+      - POSTGRES_DB=gallery
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    container_name: gallery-app
+    restart: always
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=postgresql://user:password@db:5432/gallery
+      # Google Drive Configuration
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - DRIVE_FOLDER_ID_1=${DRIVE_FOLDER_ID_1}
+      - DRIVE_REFRESH_TOKEN_1=${DRIVE_REFRESH_TOKEN_1}
+      # ... (Thêm các biến khác vào file .env của bạn)
+    volumes:
+      - ./uploads:/app/uploads
+
+volumes:
+  postgres_data:

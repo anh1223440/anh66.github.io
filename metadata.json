@@ -1,0 +1,5 @@
+{
+  "name": "Personal Media Gallery",
+  "description": "A modern, responsive personal photo and video gallery that stores media on Google Drive.",
+  "requestFramePermissions": []
+}
