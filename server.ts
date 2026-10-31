@@ -28,7 +28,6 @@ const FACE_SERVICE_URL = process.env.FACE_SERVICE_URL || "http://localhost:8000"
 const MEMORIES_FOLDER_NAME = process.env.MEMORIES_FOLDER_NAME || "anh cacke";
 const MEMORIES_FOLDER_ID = process.env.MEMORIES_FOLDER_ID || "";
 
-// Chỉ dùng các account này để Upload và làm các việc khác
 const DRIVE_ACCOUNTS = [
   { folderId: process.env.DRIVE_FOLDER_ID_1 || "", refreshToken: process.env.DRIVE_REFRESH_TOKEN_1 || "" },
   { folderId: process.env.DRIVE_FOLDER_ID_2 || "", refreshToken: process.env.DRIVE_REFRESH_TOKEN_2 || "" },
@@ -123,7 +122,49 @@ async function getOrCreateMemoriesFolder(drive: any, parentFolderId: string): Pr
 let currentAccountIndex = 0;
 const app = express();
 app.use(express.json({ limit: "200mb" }));
-app.use((req, res, next) => { req.setTimeout(10*60*1000); res.setTimeout(10*60*1000); next(); });
+app.use((req, res, next) => { req.setTimeout(10 * 60 * 1000); res.setTimeout(10 * 60 * 1000); next(); });
+
+// ============================================================
+// CLOUDFLARE CACHE HELPERS
+// ============================================================
+type CachePolicy = "static-immutable" | "long" | "medium" | "short" | "realtime" | "mutation";
+
+function setCache(res: express.Response, policy: CachePolicy) {
+  switch (policy) {
+    case "static-immutable":
+      // Ảnh/video đã upload không bao giờ đổi → cache 1 năm ở Cloudflare + browser
+      res.setHeader("Cache-Control", "public, max-age=31536000, s-maxage=31536000, immutable");
+      res.setHeader("Vary", "Accept-Encoding");
+      break;
+    case "long":
+      // Dữ liệu ít đổi (notes, schedule) → 1 ngày
+      res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400, stale-while-revalidate=604800");
+      break;
+    case "medium":
+      // Danh sách album, people, memories → 1 giờ ở edge, 5 phút ở browser
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400");
+      break;
+    case "short":
+      // Danh sách media có search/album → 5 phút ở edge
+      res.setHeader("Cache-Control", "public, max-age=60, s-maxage=300, stale-while-revalidate=600");
+      break;
+    case "realtime":
+      // Trạng thái scan, progress → không cache
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+      break;
+    case "mutation":
+      // POST/PUT/DELETE → cấm cache tuyệt đối
+      res.setHeader("Cache-Control", "no-store");
+      break;
+  }
+}
+
+// Cache-Tag để purge chọn lọc trên Cloudflare (tuỳ chọn nhưng rất hữu ích)
+function setCacheTags(res: express.Response, ...tags: string[]) {
+  if (tags.length > 0) res.setHeader("Cache-Tag", tags.join(","));
+}
+
+// ============================================================
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 * 1024 } });
 
 async function downloadDriveFile(fileId: string): Promise<Buffer | null> {
@@ -176,7 +217,7 @@ async function processMediaFaces(mediaId: number): Promise<boolean> {
       formData.append("file", new Blob([imgBuffer], { type: "image/jpeg" }), "img.jpg");
       const detectRes = await fetch(`${FACE_SERVICE_URL}/detect`, { method: "POST", body: formData });
       if (!detectRes.ok) continue;
-      
+
       const data = await detectRes.json();
       for (const obj of (data.objects || [])) {
         let isDuplicate = false;
@@ -186,7 +227,7 @@ async function processMediaFaces(mediaId: number): Promise<boolean> {
           if (dot > 0.65) { isDuplicate = true; break; }
         }
         if (isDuplicate) continue;
-        
+
         seenEmbeddings.push({ vec: obj.embedding, type: obj.type });
         totalObjectsFound++;
         await dbRun(
@@ -211,11 +252,11 @@ async function reclusterFaces() {
   const vectors = allEmbeddings.map((e: any) => e.embedding);
   const types = allEmbeddings.map((e: any) => e.type);
   const ids = allEmbeddings.map((e: any) => e.id);
-  
+
   const clusterRes = await fetch(`${FACE_SERVICE_URL}/cluster`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ embeddings: vectors, types: types }) });
   if (!clusterRes.ok) return;
   const { clusters } = await clusterRes.json();
-  
+
   const existingClusters = await dbQuery("SELECT id, name, centroid, cover_face_id FROM face_clusters", "");
   await dbRun("UPDATE face_embeddings SET cluster_id = NULL", "");
   const newClusterIds: number[] = [];
@@ -223,10 +264,10 @@ async function reclusterFaces() {
   for (const clusterIndices of clusters) {
     if (clusterIndices.length < 2) continue;
     const clusterEmbeddings = clusterIndices.map((i: number) => vectors[i]);
-    const vecLength = clusterEmbeddings[0].length; 
+    const vecLength = clusterEmbeddings[0].length;
     const centroid = new Array(vecLength).fill(0);
     for (const emb of clusterEmbeddings) for (let j = 0; j < vecLength; j++) centroid[j] += emb[j] / clusterEmbeddings.length;
-    
+
     const cNorm = Math.sqrt(centroid.reduce((s, v) => s + v * v, 0)) || 1;
     for (let j = 0; j < vecLength; j++) centroid[j] /= cNorm;
 
@@ -239,7 +280,7 @@ async function reclusterFaces() {
     const faceIdsInCluster = clusterIndices.map((i: number) => ids[i]);
     const bestFaceRow = await dbGet(`SELECT id FROM face_embeddings WHERE id = ANY($1) ORDER BY quality DESC LIMIT 1`, "", [faceIdsInCluster]);
     const coverFaceId = bestFaceRow?.id || faceIdsInCluster[0];
-    
+
     let clusterId: number;
     if (matched) {
       clusterId = matched.id;
@@ -308,11 +349,11 @@ async function renderMemoryVideo(memoryId: number) {
 
     const concatFile = path.join(tmpDir, `concat.txt`);
     fs.writeFileSync(concatFile, imagePaths.map(p => `file '${p.replace(/\\/g, "/")}'\nduration 3`).concat([`file '${imagePaths[imagePaths.length - 1].replace(/\\/g, "/")}'`]).join("\n"));
-    
+
     const outputPath = path.join(tmpDir, `memory.mp4`);
 
     await new Promise<void>((resolve, reject) => {
-      ffmpeg().input(concatFile).inputOptions(["-f concat", "-safe 0"]).outputOptions(["-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p","-c:v", "libx264","-preset", "veryfast","-crf", "23","-r", "30","-pix_fmt", "yuv420p","-movflags", "+faststart"]).output(outputPath).on("end", () => resolve()).on("error", (err) => reject(err)).run();
+      ffmpeg().input(concatFile).inputOptions(["-f concat", "-safe 0"]).outputOptions(["-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]).output(outputPath).on("end", () => resolve()).on("error", (err) => reject(err)).run();
     });
 
     const videoBuffer = fs.readFileSync(outputPath);
@@ -354,11 +395,31 @@ async function renderMemoryVideo(memoryId: number) {
 // ROUTES API
 // ==========================================
 
-app.get("/api/albums", async (req, res) => { try { res.json(await dbQuery("SELECT * FROM albums ORDER BY name ASC", "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.post("/api/albums", async (req, res) => { const { name } = req.body; if (!name) return res.status(400).json({ error: "Name required" }); try { const id = await dbInsertReturningId("INSERT INTO albums (name) VALUES ($1) RETURNING id", "", [name]); res.json({ id, name }); } catch { res.status(400).json({ error: "Exists" }); } });
-app.delete("/api/albums/:id", async (req, res) => { try { await dbRun("DELETE FROM albums WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+// ---------- Albums ----------
+app.get("/api/albums", async (req, res) => {
+  setCache(res, "medium");
+  setCacheTags(res, "albums");
+  try { res.json(await dbQuery("SELECT * FROM albums ORDER BY name ASC", "")); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
 
+app.post("/api/albums", async (req, res) => {
+  setCache(res, "mutation");
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: "Name required" });
+  try { const id = await dbInsertReturningId("INSERT INTO albums (name) VALUES ($1) RETURNING id", "", [name]); res.json({ id, name }); }
+  catch { res.status(400).json({ error: "Exists" }); }
+});
+
+app.delete("/api/albums/:id", async (req, res) => {
+  setCache(res, "mutation");
+  try { await dbRun("DELETE FROM albums WHERE id = $1", "", [req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+// ---------- Media upload ----------
 app.post("/api/media", upload.single("file"), async (req, res) => {
+  setCache(res, "mutation");
   const file = req.file; const { album_id } = req.body;
   if (!file) return res.status(400).json({ error: "No file" });
   try {
@@ -378,7 +439,9 @@ app.post("/api/media", upload.single("file"), async (req, res) => {
   } catch (error: any) { res.status(500).json({ error: "Failed" }); }
 });
 
+// ---------- Media list ----------
 app.get("/api/media", async (req, res) => {
+  setCache(res, "short");
   const { search, album_id, tag } = req.query;
   let queryPg = `SELECT m.*, a.name as album_name, STRING_AGG(t.name, ',') as tags FROM media m LEFT JOIN albums a ON m.album_id = a.id LEFT JOIN media_tags mt ON m.id = mt.media_id LEFT JOIN tags t ON mt.tag_id = t.id WHERE 1=1`;
   const params: any[] = []; let p = 1;
@@ -386,12 +449,17 @@ app.get("/api/media", async (req, res) => {
   if (album_id) { queryPg += ` AND m.album_id = $${p++}`; params.push(album_id); }
   if (tag) { queryPg += ` AND m.id IN (SELECT media_id FROM media_tags mt2 JOIN tags t2 ON mt2.tag_id = t2.id WHERE t2.name = $${p++})`; params.push(tag); }
   queryPg += ` GROUP BY m.id, a.name ORDER BY m.created_at DESC`;
+  if (album_id) setCacheTags(res, `album-${album_id}`);
   try { res.json(await dbQuery(queryPg, "", params)); } catch (e) { res.status(500).json({ error: "DB Err" }); }
 });
 
+// ---------- Media file (stream) ----------
 app.get("/api/media/:id/file", async (req, res) => {
+  setCache(res, "static-immutable");
+  setCacheTags(res, `media-${req.params.id}`, `media-file-${req.params.id}`);
   try {
-    const media = await dbGet("SELECT * FROM media WHERE id = $1", "", [req.params.id]); if (!media) return res.status(404).json({ error: "Not found" });
+    const media = await dbGet("SELECT * FROM media WHERE id = $1", "", [req.params.id]);
+    if (!media) return res.status(404).json({ error: "Not found" });
     let driveRes: any = null;
     for (const account of DRIVE_ACCOUNTS) {
       try {
@@ -408,9 +476,13 @@ app.get("/api/media/:id/file", async (req, res) => {
   } catch { res.status(500).json({ error: "Err" }); }
 });
 
+// ---------- Media thumbnail ----------
 app.get("/api/media/:id/thumbnail", async (req, res) => {
+  setCache(res, "static-immutable");
+  setCacheTags(res, `media-${req.params.id}`, `media-thumb-${req.params.id}`);
   try {
-    const media = await dbGet("SELECT * FROM media WHERE id = $1", "", [req.params.id]); if (!media) return res.status(404).json({ error: "Not found" });
+    const media = await dbGet("SELECT * FROM media WHERE id = $1", "", [req.params.id]);
+    if (!media) return res.status(404).json({ error: "Not found" });
     const size = parseInt(req.query.size as string) || 400;
     let thumbnailLink = media.thumbnail_link;
     if (!thumbnailLink) {
@@ -425,32 +497,40 @@ app.get("/api/media/:id/thumbnail", async (req, res) => {
     const response = await fetch(thumbnailLink.replace(/=s\d+$/, `=s${size}`), { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error("HTTP Err");
     res.setHeader("Content-Type", response.headers.get("content-type") || "image/jpeg");
-    res.setHeader("Cache-Control", "public, max-age=86400");
     res.send(Buffer.from(await response.arrayBuffer()));
   } catch (error) { res.redirect(`/api/media/${req.params.id}/file`); }
 });
 
+// ---------- Media delete ----------
 app.delete("/api/media/:id", async (req, res) => {
+  setCache(res, "mutation");
   try {
-    const media = await dbGet("SELECT * FROM media WHERE id = $1", "", [req.params.id]); if (!media) return res.status(404).json({ error: "Not found" });
+    const media = await dbGet("SELECT * FROM media WHERE id = $1", "", [req.params.id]);
+    if (!media) return res.status(404).json({ error: "Not found" });
     for (const account of DRIVE_ACCOUNTS) { try { await getDriveClient(account.refreshToken).files.delete({ fileId: media.drive_file_id }); break; } catch (e: any) { if (e.code === 404) continue; } }
     await dbRun("DELETE FROM media WHERE id = $1", "", [req.params.id]);
     res.json({ success: true });
   } catch { res.status(500).json({ error: "Err" }); }
 });
 
-app.put("/api/media/:id/album", async (req, res) => { try { await dbRun("UPDATE media SET album_id = $1 WHERE id = $2", "", [req.body.album_id || null, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.put("/api/media/:id/album", async (req, res) => {
+  setCache(res, "mutation");
+  try { await dbRun("UPDATE media SET album_id = $1 WHERE id = $2", "", [req.body.album_id || null, req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
 
 
 // ==========================================
 // API DRIVE (Dành riêng cho tab Folder)
 // ==========================================
 app.get("/api/drive/files", async (req, res) => {
+  // Cache 10 phút ở edge vì folder Drive có thể thay đổi khi có upload mới
+  setCache(res, "short");
+  setCacheTags(res, "drive");
   try {
     const { folderId } = req.query;
     if (!folderId) return res.status(400).json({ error: "folderId is required" });
 
-    // Vì folder ID được truyền trực tiếp, ta thử tìm trên tất cả các account
     let filesData: any[] = [];
     let success = false;
 
@@ -465,16 +545,11 @@ app.get("/api/drive/files", async (req, res) => {
         });
         filesData = response.data.files || [];
         success = true;
-        break; // Nếu thành công thì dừng
-      } catch (e: any) {
-        // 404 có thể do token này không có quyền, thử token khác
-        continue;
-      }
+        break;
+      } catch (e: any) { continue; }
     }
 
-    if (!success) {
-      return res.status(404).json({ error: "Không tìm thấy folder hoặc không có quyền truy cập." });
-    }
+    if (!success) return res.status(404).json({ error: "Không tìm thấy folder hoặc không có quyền truy cập." });
 
     res.json(filesData);
   } catch (error: any) {
@@ -484,11 +559,13 @@ app.get("/api/drive/files", async (req, res) => {
 });
 
 app.get("/api/drive/stream/:id", async (req, res) => {
+  setCache(res, "static-immutable");
+  setCacheTags(res, `drive-${req.params.id}`);
   try {
     const { id } = req.params;
     const isDownload = req.query.download === "true";
     const isThumbnail = req.query.thumbnail === "true";
-    
+
     let driveRes: any = null;
     for (const account of DRIVE_ACCOUNTS) {
       try {
@@ -499,19 +576,20 @@ app.get("/api/drive/stream/:id", async (req, res) => {
         break;
       } catch (e: any) { if (e.code === 404) continue; }
     }
-    
+
     if (!driveRes) return res.status(404).json({ error: "File not found on Drive" });
 
     if (isThumbnail) {
-      // Với thumbnail, ta không set Content-Type cố định vì Drive trả về đúng type
       const meta = await driveRes.data;
       res.setHeader("Content-Type", meta.headers?.["content-type"] || "image/jpeg");
     } else {
-      res.setHeader("Content-Type", "application/octet-stream");
+      // Trả đúng MIME type để <video>/<img> render được, KHÔNG dùng octet-stream
+      const meta = await getDriveClient(DRIVE_ACCOUNTS[0].refreshToken).files.get({ fileId: id, fields: "mimeType" }).catch(() => null);
+      res.setHeader("Content-Type", meta?.data?.mimeType || "application/octet-stream");
     }
-    
+
     if (isDownload) res.setHeader("Content-Disposition", `attachment`);
-    
+
     driveRes.data.pipe(res);
   } catch (error: any) {
     res.status(500).json({ error: "Failed to stream file" });
@@ -521,30 +599,172 @@ app.get("/api/drive/stream/:id", async (req, res) => {
 // ==========================================
 // API KHÁC (Faces, Memories, ...)
 // ==========================================
-app.get("/api/faces/scan/status", (req, res) => res.json(scanState));
-app.post("/api/faces/scan", (req, res) => { if (scanState.running) return res.json({ success: false }); scanAllFaces().catch(console.error); res.json({ success: true }); });
-app.get("/api/faces/people", async (req, res) => { try { res.json(await dbQuery(`SELECT c.*, f.thumbnail_base64 as cover_thumb FROM face_clusters c LEFT JOIN face_embeddings f ON c.cover_face_id = f.id WHERE c.face_count >= 2 ORDER BY c.face_count DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.get("/api/faces/thumbnail/:faceId", async (req, res) => { try { const face = await dbGet("SELECT thumbnail_base64 FROM face_embeddings WHERE id = $1", "", [req.params.faceId]); if (!face || !face.thumbnail_base64) return res.status(404).end(); res.setHeader("Content-Type", "image/jpeg"); res.setHeader("Cache-Control", "public, max-age=86400"); res.send(Buffer.from(face.thumbnail_base64, "base64")); } catch { res.status(500).end(); } });
-app.get("/api/faces/people/:clusterId/media", async (req, res) => { try { res.json(await dbQuery(`SELECT m.*, fe.face_index FROM media m JOIN face_embeddings fe ON m.id = fe.media_id WHERE fe.cluster_id = $1 ORDER BY m.created_at DESC`, "", [req.params.clusterId])); } catch { res.status(500).json({ error: "Err" }); } });
-app.get("/api/faces/no-people", async (req, res) => { try { res.json(await dbQuery(`SELECT * FROM media WHERE has_people = FALSE AND face_processed = TRUE ORDER BY created_at DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.put("/api/faces/people/:id", async (req, res) => { try { await dbRun("UPDATE face_clusters SET name = $1, updated_at = NOW() WHERE id = $2", "", [req.body.name, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
-app.delete("/api/faces/people/:id", async (req, res) => { try { await dbRun("UPDATE face_embeddings SET cluster_id = NULL WHERE cluster_id = $1", "", [req.params.id]); await dbRun("DELETE FROM face_clusters WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.get("/api/faces/scan/status", (req, res) => {
+  setCache(res, "realtime");
+  res.json(scanState);
+});
 
-app.get("/api/memories", async (req, res) => { try { res.json(await dbQuery(`SELECT m.id, m.title, m.type, m.cluster_id, m.media_ids, m.cover_media_id, m.status, m.created_at, c.name as cluster_name FROM memories m LEFT JOIN face_clusters c ON m.cluster_id = c.id ORDER BY m.created_at DESC`, "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.post("/api/memories/create", async (req, res) => { try { const id = await dbInsertReturningId(`INSERT INTO memories (title, type, cluster_id, status) VALUES ($1, 'person', $2, 'pending') RETURNING id`, "", [req.body.title || "Memories", req.body.clusterId]); res.json({ memoryId: id }); renderMemoryVideo(id).catch(console.error); } catch { res.status(500).json({ error: "Err" }); } });
-app.get("/api/memories/:id/video", async (req, res) => { try { const mem = await dbGet("SELECT video_base64 FROM memories WHERE id = $1", "", [req.params.id]); if (!mem || !mem.video_base64) return res.status(404).json({ error: "Not ready" }); let driveRes: any = null; for (const account of DRIVE_ACCOUNTS) { try { driveRes = await getDriveClient(account.refreshToken).files.get({ fileId: mem.video_base64, alt: "media", acknowledgeAbuse: true }, { responseType: "stream" }); break; } catch (e: any) { if (e.code === 404) continue; } } if (!driveRes) return res.status(404).json({ error: "Not found on Drive" }); res.setHeader("Content-Type", "video/mp4"); driveRes.data.pipe(res); } catch { res.status(500).json({ error: "Err" }); } });
-app.get("/api/memories/:id/cover", async (req, res) => { try { const mem = await dbGet("SELECT cover_media_id FROM memories WHERE id = $1", "", [req.params.id]); if (!mem?.cover_media_id) return res.status(404).end(); res.redirect(`/api/media/${mem.cover_media_id}/thumbnail?size=600`); } catch { res.status(404).end(); } });
-app.delete("/api/memories/:id", async (req, res) => { try { await dbRun("DELETE FROM memories WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.post("/api/faces/scan", (req, res) => {
+  setCache(res, "mutation");
+  if (scanState.running) return res.json({ success: false });
+  scanAllFaces().catch(console.error);
+  res.json({ success: true });
+});
 
-app.get("/api/notes", async (req, res) => { try { res.json(await dbQuery("SELECT * FROM notes ORDER BY created_at DESC", "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.post("/api/notes", async (req, res) => { const { title, content, color } = req.body; try { const id = await dbInsertReturningId("INSERT INTO notes (title, content, color) VALUES ($1, $2, $3) RETURNING id", "", [title, content, color]); res.json({ id, title, content, color }); } catch { res.status(500).json({ error: "Err" }); } });
-app.put("/api/notes/:id", async (req, res) => { const { title, content, color } = req.body; try { await dbRun("UPDATE notes SET title=$1, content=$2, color=$3 WHERE id=$4", "", [title, content, color, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
-app.delete("/api/notes/:id", async (req, res) => { try { await dbRun("DELETE FROM notes WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.get("/api/faces/people", async (req, res) => {
+  setCache(res, "medium");
+  setCacheTags(res, "people");
+  try { res.json(await dbQuery(`SELECT c.*, f.thumbnail_base64 as cover_thumb FROM face_clusters c LEFT JOIN face_embeddings f ON c.cover_face_id = f.id WHERE c.face_count >= 2 ORDER BY c.face_count DESC`, "")); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
 
-app.get("/api/schedule", async (req, res) => { try { res.json(await dbQuery("SELECT * FROM schedule ORDER BY day_of_week, start_time", "")); } catch { res.status(500).json({ error: "Err" }); } });
-app.post("/api/schedule", async (req, res) => { const { subject, day_of_week, start_time, end_time, room } = req.body; try { const id = await dbInsertReturningId("INSERT INTO schedule (subject, day_of_week, start_time, end_time, room) VALUES ($1,$2,$3,$4,$5) RETURNING id", "", [subject, day_of_week, start_time, end_time, room]); res.json({ id, subject, day_of_week, start_time, end_time, room }); } catch { res.status(500).json({ error: "Err" }); } });
-app.put("/api/schedule/:id", async (req, res) => { const { subject, day_of_week, start_time, end_time, room } = req.body; try { await dbRun("UPDATE schedule SET subject=$1, day_of_week=$2, start_time=$3, end_time=$4, room=$5 WHERE id=$6", "", [subject, day_of_week, start_time, end_time, room, req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
-app.delete("/api/schedule/:id", async (req, res) => { try { await dbRun("DELETE FROM schedule WHERE id = $1", "", [req.params.id]); res.json({ success: true }); } catch { res.status(500).json({ error: "Err" }); } });
+app.get("/api/faces/thumbnail/:faceId", async (req, res) => {
+  setCache(res, "static-immutable");
+  setCacheTags(res, `face-${req.params.faceId}`);
+  try {
+    const face = await dbGet("SELECT thumbnail_base64 FROM face_embeddings WHERE id = $1", "", [req.params.faceId]);
+    if (!face || !face.thumbnail_base64) return res.status(404).end();
+    res.setHeader("Content-Type", "image/jpeg");
+    res.send(Buffer.from(face.thumbnail_base64, "base64"));
+  } catch { res.status(500).end(); }
+});
+
+app.get("/api/faces/people/:clusterId/media", async (req, res) => {
+  setCache(res, "medium");
+  setCacheTags(res, `cluster-${req.params.clusterId}`);
+  try { res.json(await dbQuery(`SELECT m.*, fe.face_index FROM media m JOIN face_embeddings fe ON m.id = fe.media_id WHERE fe.cluster_id = $1 ORDER BY m.created_at DESC`, "", [req.params.clusterId])); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.get("/api/faces/no-people", async (req, res) => {
+  setCache(res, "medium");
+  setCacheTags(res, "no-people");
+  try { res.json(await dbQuery(`SELECT * FROM media WHERE has_people = FALSE AND face_processed = TRUE ORDER BY created_at DESC`, "")); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.put("/api/faces/people/:id", async (req, res) => {
+  setCache(res, "mutation");
+  try { await dbRun("UPDATE face_clusters SET name = $1, updated_at = NOW() WHERE id = $2", "", [req.body.name, req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.delete("/api/faces/people/:id", async (req, res) => {
+  setCache(res, "mutation");
+  try {
+    await dbRun("UPDATE face_embeddings SET cluster_id = NULL WHERE cluster_id = $1", "", [req.params.id]);
+    await dbRun("DELETE FROM face_clusters WHERE id = $1", "", [req.params.id]);
+    res.json({ success: true });
+  } catch { res.status(500).json({ error: "Err" }); }
+});
+
+// ---------- Memories ----------
+app.get("/api/memories", async (req, res) => {
+  // Status có thể đổi (pending → rendering → ready) nên cache ngắn
+  setCache(res, "short");
+  setCacheTags(res, "memories");
+  try {
+    res.json(await dbQuery(`SELECT m.id, m.title, m.type, m.cluster_id, m.media_ids, m.cover_media_id, m.status, m.created_at, c.name as cluster_name FROM memories m LEFT JOIN face_clusters c ON m.cluster_id = c.id ORDER BY m.created_at DESC`, ""));
+  } catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.post("/api/memories/create", async (req, res) => {
+  setCache(res, "mutation");
+  try {
+    const id = await dbInsertReturningId(`INSERT INTO memories (title, type, cluster_id, status) VALUES ($1, 'person', $2, 'pending') RETURNING id`, "", [req.body.title || "Memories", req.body.clusterId]);
+    res.json({ memoryId: id });
+    renderMemoryVideo(id).catch(console.error);
+  } catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.get("/api/memories/:id/video", async (req, res) => {
+  setCache(res, "static-immutable");
+  setCacheTags(res, `memory-${req.params.id}`);
+  try {
+    const mem = await dbGet("SELECT video_base64 FROM memories WHERE id = $1", "", [req.params.id]);
+    if (!mem || !mem.video_base64) return res.status(404).json({ error: "Not ready" });
+    let driveRes: any = null;
+    for (const account of DRIVE_ACCOUNTS) {
+      try { driveRes = await getDriveClient(account.refreshToken).files.get({ fileId: mem.video_base64, alt: "media", acknowledgeAbuse: true }, { responseType: "stream" }); break; }
+      catch (e: any) { if (e.code === 404) continue; }
+    }
+    if (!driveRes) return res.status(404).json({ error: "Not found on Drive" });
+    res.setHeader("Content-Type", "video/mp4");
+    driveRes.data.pipe(res);
+  } catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.get("/api/memories/:id/cover", async (req, res) => {
+  setCache(res, "static-immutable");
+  setCacheTags(res, `memory-${req.params.id}`, "memories");
+  try {
+    const mem = await dbGet("SELECT cover_media_id FROM memories WHERE id = $1", "", [req.params.id]);
+    if (!mem?.cover_media_id) return res.status(404).end();
+    res.redirect(`/api/media/${mem.cover_media_id}/thumbnail?size=600`);
+  } catch { res.status(404).end(); }
+});
+
+app.delete("/api/memories/:id", async (req, res) => {
+  setCache(res, "mutation");
+  try { await dbRun("DELETE FROM memories WHERE id = $1", "", [req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+// ---------- Notes ----------
+app.get("/api/notes", async (req, res) => {
+  setCache(res, "long");
+  setCacheTags(res, "notes");
+  try { res.json(await dbQuery("SELECT * FROM notes ORDER BY created_at DESC", "")); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.post("/api/notes", async (req, res) => {
+  setCache(res, "mutation");
+  const { title, content, color } = req.body;
+  try { const id = await dbInsertReturningId("INSERT INTO notes (title, content, color) VALUES ($1, $2, $3) RETURNING id", "", [title, content, color]); res.json({ id, title, content, color }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.put("/api/notes/:id", async (req, res) => {
+  setCache(res, "mutation");
+  const { title, content, color } = req.body;
+  try { await dbRun("UPDATE notes SET title=$1, content=$2, color=$3 WHERE id=$4", "", [title, content, color, req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.delete("/api/notes/:id", async (req, res) => {
+  setCache(res, "mutation");
+  try { await dbRun("DELETE FROM notes WHERE id = $1", "", [req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+// ---------- Schedule ----------
+app.get("/api/schedule", async (req, res) => {
+  setCache(res, "long");
+  setCacheTags(res, "schedule");
+  try { res.json(await dbQuery("SELECT * FROM schedule ORDER BY day_of_week, start_time", "")); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.post("/api/schedule", async (req, res) => {
+  setCache(res, "mutation");
+  const { subject, day_of_week, start_time, end_time, room } = req.body;
+  try { const id = await dbInsertReturningId("INSERT INTO schedule (subject, day_of_week, start_time, end_time, room) VALUES ($1,$2,$3,$4,$5) RETURNING id", "", [subject, day_of_week, start_time, end_time, room]); res.json({ id, subject, day_of_week, start_time, end_time, room }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.put("/api/schedule/:id", async (req, res) => {
+  setCache(res, "mutation");
+  const { subject, day_of_week, start_time, end_time, room } = req.body;
+  try { await dbRun("UPDATE schedule SET subject=$1, day_of_week=$2, start_time=$3, end_time=$4, room=$5 WHERE id=$6", "", [subject, day_of_week, start_time, end_time, room, req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
+
+app.delete("/api/schedule/:id", async (req, res) => {
+  setCache(res, "mutation");
+  try { await dbRun("DELETE FROM schedule WHERE id = $1", "", [req.params.id]); res.json({ success: true }); }
+  catch { res.status(500).json({ error: "Err" }); }
+});
 
 
 // ==========================================
@@ -567,14 +787,27 @@ async function startServer() {
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
-    // 1. Phục vụ file tĩnh
-    app.use(express.static(path.join(__dirname, "dist")));
-    
-    // 2. Fallback SPA (Bỏ qua các route bắt đầu bằng /api)
+    // Static assets (JS/CSS/HTML của Vite build) → cache mạnh 1 năm
+    app.use(
+      express.static(path.join(__dirname, "dist"), {
+        setHeaders: (res, filePath) => {
+          // Assets có hash trong tên → cache immutable
+          if (/\.[a-f0-9]{8,}\.(js|css|woff2?|ttf|eot|svg|png|jpg|jpeg|gif|webp|avif)$/i.test(filePath)) {
+            res.setHeader("Cache-Control", "public, max-age=31536000, s-maxage=31536000, immutable");
+          } else {
+            // index.html → KHÔNG cache để luôn nhận bản mới khi deploy
+            res.setHeader("Cache-Control", "no-cache");
+          }
+        },
+      })
+    );
+
+    // SPA fallback
     app.get("*", (req, res) => {
       if (req.path.startsWith("/api")) {
         return res.status(404).json({ error: "API route not found" });
       }
+      res.setHeader("Cache-Control", "no-cache");
       res.sendFile(path.join(__dirname, "dist", "index.html"));
     });
   }
@@ -593,6 +826,7 @@ async function startServer() {
       } catch { scanState = { running: false, total: 0, done: 0, current: "" }; }
     };
     setInterval(runBackgroundScanner, 30 * 1000);
+    console.log(`Server listening on port ${process.env.PORT || 3001}`);
   });
   server.timeout = 10 * 60 * 1000;
 }
